@@ -10,6 +10,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <assert.h>
+#include <xf86drm.h>
+#include <libdrm/drm.h>
 #include <libdrm/drm_fourcc.h>
 
 #include "screencast.h"
@@ -18,9 +20,95 @@
 #include "logger.h"
 
 #define DAMAGE_REGION_COUNT 16
+#define XDPW_SYNC_TIMELINE_DATA_COUNT 2
+
+enum xdpw_sync_timeline_index {
+	XDPW_SYNC_TIMELINE_ACQUIRE = 0,
+	XDPW_SYNC_TIMELINE_RELEASE = 1,
+};
+
+static bool pwr_syncobj_timeline_supported(struct xdpw_screencast_instance *cast) {
+	if (cast->ctx->gbm == NULL) {
+		return false;
+	}
+
+	int drm_fd = gbm_device_get_fd(cast->ctx->gbm);
+	if (drm_fd < 0) {
+		return false;
+	}
+
+	uint64_t syncobj = 0;
+	if (drmGetCap(drm_fd, DRM_CAP_SYNCOBJ, &syncobj) != 0 || syncobj == 0) {
+		return false;
+	}
+
+	uint64_t timeline = 0;
+	if (drmGetCap(drm_fd, DRM_CAP_SYNCOBJ_TIMELINE, &timeline) != 0 || timeline == 0) {
+		return false;
+	}
+
+	return true;
+}
+
+static bool pwr_init_syncobj_timelines(struct xdpw_screencast_instance *cast,
+		struct xdpw_buffer *xdpw_buffer) {
+	if (!cast->syncobj_timeline_enabled || xdpw_buffer->buffer_type != DMABUF) {
+		return true;
+	}
+
+	int drm_fd = gbm_device_get_fd(cast->ctx->gbm);
+	if (drm_fd < 0) {
+		return false;
+	}
+	xdpw_buffer->syncobj_drm_fd = drm_fd;
+
+	for (size_t i = 0; i < XDPW_SYNC_TIMELINE_DATA_COUNT; i++) {
+		if (drmSyncobjCreate(drm_fd, 0, &xdpw_buffer->syncobj_timeline_handle[i]) != 0) {
+			logprint(ERROR, "pipewire: drmSyncobjCreate failed for sync timeline %zu", i);
+			goto fail;
+		}
+
+		if (drmSyncobjHandleToFD(drm_fd, xdpw_buffer->syncobj_timeline_handle[i],
+				&xdpw_buffer->syncobj_timeline_fd[i]) != 0) {
+			logprint(ERROR, "pipewire: drmSyncobjHandleToFD failed for sync timeline %zu", i);
+			goto fail;
+		}
+	}
+
+	xdpw_buffer->has_syncobj_timeline = true;
+	return true;
+
+fail:
+	for (size_t i = 0; i < XDPW_SYNC_TIMELINE_DATA_COUNT; i++) {
+		if (xdpw_buffer->syncobj_timeline_fd[i] >= 0) {
+			close(xdpw_buffer->syncobj_timeline_fd[i]);
+			xdpw_buffer->syncobj_timeline_fd[i] = -1;
+		}
+		if (xdpw_buffer->syncobj_timeline_handle[i] != 0) {
+			drmSyncobjDestroy(drm_fd, xdpw_buffer->syncobj_timeline_handle[i]);
+			xdpw_buffer->syncobj_timeline_handle[i] = 0;
+		}
+	}
+	return false;
+}
+
+static bool pwr_signal_syncobj_acquire(struct xdpw_buffer *xdpw_buffer, uint64_t acquire_point) {
+	if (!xdpw_buffer->has_syncobj_timeline || xdpw_buffer->syncobj_drm_fd < 0) {
+		return false;
+	}
+
+	uint32_t handle = xdpw_buffer->syncobj_timeline_handle[XDPW_SYNC_TIMELINE_ACQUIRE];
+	uint64_t point = acquire_point;
+	if (drmSyncobjTimelineSignal(xdpw_buffer->syncobj_drm_fd, &handle, &point, 1) != 0) {
+		logprint(ERROR, "pipewire: drmSyncobjTimelineSignal failed for acquire point=%"PRIu64, acquire_point);
+		return false;
+	}
+
+	return true;
+}
 
 static struct spa_pod *build_buffer(struct spa_pod_builder *b, uint32_t blocks, uint32_t size,
-		uint32_t stride, uint32_t datatype) {
+		uint32_t stride, uint32_t datatype, uint32_t metatype) {
 	assert(blocks > 0);
 	assert(datatype > 0);
 	struct spa_pod_frame f[1];
@@ -37,6 +125,9 @@ static struct spa_pod *build_buffer(struct spa_pod_builder *b, uint32_t blocks, 
 	}
 	spa_pod_builder_add(b, SPA_PARAM_BUFFERS_align, SPA_POD_Int(XDPW_PWR_ALIGN), 0);
 	spa_pod_builder_add(b, SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(datatype), 0);
+	if (metatype > 0) {
+		spa_pod_builder_add(b, SPA_PARAM_BUFFERS_metaType, SPA_POD_Int(metatype), 0);
+	}
 	return spa_pod_builder_pop(b, &f[0]);
 }
 
@@ -224,6 +315,7 @@ void xdpw_pwr_enqueue_buffer(struct xdpw_screencast_instance *cast) {
 	struct pw_buffer *pw_buf = cast->current_frame.pw_buffer;
 	struct spa_buffer *spa_buf = pw_buf->buffer;
 	struct spa_data *d = spa_buf->datas;
+	struct xdpw_buffer *xdpw_buffer = cast->current_frame.xdpw_buffer;
 
 	bool buffer_corrupt = !cast->current_frame.completed;
 
@@ -247,6 +339,21 @@ void xdpw_pwr_enqueue_buffer(struct xdpw_screencast_instance *cast) {
 	if ((vt = spa_buffer_find_meta_data(spa_buf, SPA_META_VideoTransform, sizeof(*vt)))) {
 		vt->transform = cast->current_frame.transformation;
 		logprint(TRACE, "pipewire: transformation %u", vt->transform);
+	}
+
+	struct spa_meta_sync_timeline *st;
+	if ((st = spa_buffer_find_meta_data(spa_buf, SPA_META_SyncTimeline, sizeof(*st)))) {
+		bool has_release = spa_buffer_has_meta_features(spa_buf,
+				SPA_META_SyncTimeline, SPA_META_FEATURE_SYNC_TIMELINE_RELEASE);
+		st->acquire_point = ++cast->sync_timeline_seq;
+		st->release_point = has_release ? ++cast->sync_timeline_seq : st->acquire_point;
+		st->flags = has_release ? SPA_META_SYNC_TIMELINE_UNSCHEDULED_RELEASE : 0;
+		st->padding = 0;
+		if (cast->syncobj_timeline_enabled && !pwr_signal_syncobj_acquire(xdpw_buffer, st->acquire_point)) {
+			buffer_corrupt = true;
+		}
+		logprint(TRACE, "pipewire: sync_timeline acquire=%"PRIu64" release=%"PRIu64" flags=%u",
+				st->acquire_point, st->release_point, st->flags);
 	}
 
 	struct spa_meta *damage;
@@ -377,6 +484,7 @@ static void pwr_handle_stream_param_changed(void *data, uint32_t id,
 	struct wl_array params;
 	uint32_t blocks;
 	uint32_t data_type;
+	uint32_t metatype = 0;
 
 	if (!param || id != SPA_PARAM_Format) {
 		return;
@@ -464,10 +572,19 @@ fixate_format:
 			blocks = gbm_device_get_format_modifier_plane_count(cast->ctx->gbm,
 				fourcc, cast->pwr_format.modifier);
 		}
+
+		cast->syncobj_timeline_enabled = pwr_syncobj_timeline_supported(cast);
+		if (cast->syncobj_timeline_enabled) {
+			blocks += XDPW_SYNC_TIMELINE_DATA_COUNT;
+			data_type |= 1<<SPA_DATA_SyncObj;
+			metatype = 1 << SPA_META_SyncTimeline;
+			logprint(DEBUG, "pipewire: enabling SPA_DATA_SyncObj timelines");
+		}
 	} else {
 		cast->buffer_type = WL_SHM;
 		blocks = 1;
 		data_type = 1<<SPA_DATA_MemFd;
+		cast->syncobj_timeline_enabled = false;
 	}
 
 	logprint(DEBUG, "pipewire: Format negotiated:");
@@ -477,7 +594,7 @@ fixate_format:
 	logprint(DEBUG, "pipewire: size: (%u, %u)", cast->pwr_format.size.width, cast->pwr_format.size.height);
 	logprint(DEBUG, "pipewire: max_framerate: (%u / %u)", cast->pwr_format.max_framerate.num, cast->pwr_format.max_framerate.denom);
 
-	add_pod(&params, build_buffer(&builder.b, blocks, 0, 0, data_type));
+	add_pod(&params, build_buffer(&builder.b, blocks, 0, 0, data_type, metatype));
 
 	add_pod(&params, spa_pod_builder_add_object(&builder.b,
 		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
@@ -496,6 +613,15 @@ fixate_format:
 			sizeof(struct spa_meta_region) * DAMAGE_REGION_COUNT,
 			sizeof(struct spa_meta_region) * 1,
 			sizeof(struct spa_meta_region) * DAMAGE_REGION_COUNT)));
+
+	if (cast->syncobj_timeline_enabled) {
+		add_pod(&params, spa_pod_builder_add_object(&builder.b,
+			SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+			SPA_PARAM_META_type,
+			SPA_POD_Id(SPA_META_TYPE_FEATURES(SPA_META_SyncTimeline,
+					SPA_META_FEATURE_SYNC_TIMELINE_RELEASE)),
+			SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_sync_timeline))));
+	}
 
 	pw_stream_update_params(stream, params.data, params.size / sizeof(struct spa_pod *));
 	spa_pod_dynamic_builder_clean(&builder);
@@ -550,6 +676,36 @@ static void pwr_handle_stream_add_buffer(void *data, struct pw_buffer *buffer) {
 		// of using the flags. Until they are patched we should use some arbitrary value.
 		if (xdpw_buffer->buffer_type == DMABUF && d[plane].chunk->size == 0) {
 			d[plane].chunk->size = 9; // This was choosen by a fair d20.
+		}
+	}
+
+	if (cast->syncobj_timeline_enabled && xdpw_buffer->buffer_type == DMABUF) {
+		if (buffer->buffer->n_datas < (uint32_t)xdpw_buffer->plane_count + XDPW_SYNC_TIMELINE_DATA_COUNT) {
+			logprint(ERROR, "pipewire: syncobj enabled but only %u datas negotiated", buffer->buffer->n_datas);
+			xdpw_screencast_instance_destroy(cast);
+			return;
+		}
+
+		if (!pwr_init_syncobj_timelines(cast, xdpw_buffer)) {
+			logprint(ERROR, "pipewire: failed to initialize syncobj timelines");
+			xdpw_screencast_instance_destroy(cast);
+			return;
+		}
+
+		for (size_t i = 0; i < XDPW_SYNC_TIMELINE_DATA_COUNT; i++) {
+			uint32_t index = (uint32_t)xdpw_buffer->plane_count + i;
+			d[index].type = SPA_DATA_SyncObj;
+			d[index].flags = 0;
+			d[index].maxsize = 0;
+			d[index].mapoffset = 0;
+			d[index].fd = xdpw_buffer->syncobj_timeline_fd[i];
+			d[index].data = NULL;
+			if (d[index].chunk) {
+				d[index].chunk->offset = 0;
+				d[index].chunk->size = 0;
+				d[index].chunk->stride = 0;
+				d[index].chunk->flags = SPA_CHUNK_FLAG_NONE;
+			}
 		}
 	}
 }

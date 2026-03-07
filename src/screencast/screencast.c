@@ -77,6 +77,8 @@ void xdpw_screencast_instance_init(struct xdpw_screencast_context *ctx,
 	cast->framerate = cast->max_framerate;
 	cast->refcount = 1;
 	cast->node_id = SPA_ID_INVALID;
+	cast->sync_timeline_seq = 0;
+	cast->syncobj_timeline_enabled = false;
 	cast->avoid_dmabufs = false;
 	wl_array_init(&cast->current_frame.damage);
 	wl_list_init(&cast->buffer_list);

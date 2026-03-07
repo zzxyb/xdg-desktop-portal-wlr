@@ -106,6 +106,14 @@ static struct wl_buffer *import_wl_shm_buffer(struct xdpw_screencast_instance *c
 struct xdpw_buffer *xdpw_buffer_create(struct xdpw_screencast_instance *cast,
 		enum buffer_type buffer_type) {
 	struct xdpw_buffer *buffer = calloc(1, sizeof(struct xdpw_buffer));
+	if (buffer == NULL) {
+		return NULL;
+	}
+
+	buffer->syncobj_drm_fd = -1;
+	for (size_t i = 0; i < 2; i++) {
+		buffer->syncobj_timeline_fd[i] = -1;
+	}
 
 	uint32_t format = xdpw_format_drm_fourcc_from_pw_format(cast->pwr_format.format);
 	assert(format != DRM_FORMAT_INVALID);
@@ -233,6 +241,18 @@ struct xdpw_buffer *xdpw_buffer_create(struct xdpw_screencast_instance *cast,
 void xdpw_buffer_destroy(struct xdpw_buffer *buffer) {
 	if (buffer->buffer) {
 		wl_buffer_destroy(buffer->buffer);
+	}
+	if (buffer->syncobj_drm_fd >= 0) {
+		for (size_t i = 0; i < 2; i++) {
+			if (buffer->syncobj_timeline_handle[i] != 0) {
+				drmSyncobjDestroy(buffer->syncobj_drm_fd, buffer->syncobj_timeline_handle[i]);
+			}
+		}
+	}
+	for (size_t i = 0; i < 2; i++) {
+		if (buffer->syncobj_timeline_fd[i] >= 0) {
+			close(buffer->syncobj_timeline_fd[i]);
+		}
 	}
 	for (int plane = 0; plane < buffer->plane_count; plane++) {
 		close(buffer->fd[plane]);

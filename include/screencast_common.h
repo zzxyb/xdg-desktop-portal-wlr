@@ -80,6 +80,10 @@ struct xdpw_buffer {
 	uint32_t size[GBM_MAX_PLANES];
 	uint32_t stride[GBM_MAX_PLANES];
 	uint32_t offset[GBM_MAX_PLANES];
+	bool has_syncobj_timeline;
+	int syncobj_drm_fd;
+	int syncobj_timeline_fd[2];
+	uint32_t syncobj_timeline_handle[2];
 
 	struct wl_array damage;
 
@@ -195,6 +199,8 @@ struct xdpw_screencast_instance {
 	struct spa_hook stream_listener;
 	struct spa_video_info_raw pwr_format;
 	uint32_t seq;
+	uint64_t sync_timeline_seq;
+	bool syncobj_timeline_enabled;
 	uint32_t node_id;
 	bool pwr_stream_state;
 	uint32_t framerate;
