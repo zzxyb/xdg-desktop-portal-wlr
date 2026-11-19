@@ -159,7 +159,7 @@ bool setup_target(struct xdpw_screencast_context *ctx, struct xdpw_session *sess
 		return false;
 	}
 	target->with_cursor = sess->screencast_data.cursor_mode == EMBEDDED;
-	if (data) {
+	if (data && data->output_name && (type_mask & MONITOR)) {
 		target_initialized = xdpw_wlr_target_from_data(ctx, target, data);
 	}
 	if (!target_initialized) {
@@ -186,7 +186,10 @@ bool setup_target(struct xdpw_screencast_context *ctx, struct xdpw_session *sess
 		free(target);
 		return false;
 	}
-	assert(target->output || target->toplevel);
+	assert(target->output || target->toplevel || target->workspace);
+	if (target->type == WORKSPACE) {
+		sess->screencast_data.persist_mode = PERSIST_NONE;
+	}
 
 	// Disable screencast sharing to avoid sharing between dmabuf and shm capable clients
 	/*
@@ -218,6 +221,9 @@ bool setup_target(struct xdpw_screencast_context *ctx, struct xdpw_session *sess
 	}
 
 	switch (sess->screencast_data.screencast_instance->target->type) {
+	case WORKSPACE:
+		logprint(INFO, "wlroots: workspace: %s", target->workspace->name);
+		break;
 	case MONITOR:
 		logprint(INFO, "wlroots: output: %s", sess->screencast_data.screencast_instance->target->output->name);
 		break;
@@ -662,7 +668,7 @@ static int method_screencast_start(sd_bus_message *msg, void *data,
 			return ret;
 		}
 	}
-	ret = sd_bus_message_append(reply, "{sv}", "source_type", "u", cast->target->type);
+	ret = sd_bus_message_append(reply, "{sv}", "source_type", "u", cast->target->type == WORKSPACE ? MONITOR : cast->target->type);
 	if (ret < 0) {
 		return ret;
 	}

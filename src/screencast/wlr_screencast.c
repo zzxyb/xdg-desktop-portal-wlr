@@ -1,9 +1,12 @@
 #include "wlr_screencast.h"
+#include "workspace.h"
+#include "ext-workspace-v1-client-protocol.h"
 
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "wlr-screencopy-unstable-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 #include "ext-image-capture-source-v1-client-protocol.h"
+#include "ext-workspace-image-capture-source-v1-client-protocol.h"
 #include "ext-image-copy-capture-v1-client-protocol.h"
 #include "ext-foreign-toplevel-list-v1-client-protocol.h"
 #include <drm_fourcc.h>
@@ -29,9 +32,9 @@
 static void wlr_frame_capture_start(struct xdpw_screencast_instance *cast) {
 	fps_limit_measure_start(&cast->fps_limit, cast->framerate);
 	if (cast->ctx->ext_image_copy_capture_manager
-			&& cast->ctx->ext_output_image_capture_source_manager) {
+			&& (cast->target->type != MONITOR || cast->ctx->ext_output_image_capture_source_manager)) {
 		xdpw_ext_ic_frame_capture(cast);
-	} else if (cast->ctx->screencopy_manager) {
+	} else if (cast->target->type == MONITOR && cast->ctx->screencopy_manager) {
 		xdpw_wlr_sc_frame_capture(cast);
 	}
 }
@@ -52,27 +55,27 @@ void xdpw_wlr_frame_capture(struct xdpw_screencast_instance *cast) {
 
 void xdpw_wlr_frame_cancel(struct xdpw_screencast_instance *cast) {
 	if (cast->ctx->ext_image_copy_capture_manager
-			&& cast->ctx->ext_output_image_capture_source_manager) {
+			&& (cast->target->type != MONITOR || cast->ctx->ext_output_image_capture_source_manager)) {
 		xdpw_ext_ic_frame_cancel(cast);
-	} else if (cast->ctx->screencopy_manager) {
+	} else if (cast->target->type == MONITOR && cast->ctx->screencopy_manager) {
 		xdpw_wlr_sc_frame_cancel(cast);
 	}
 }
 
 void xdpw_wlr_session_close(struct xdpw_screencast_instance *cast) {
 	if (cast->ctx->ext_image_copy_capture_manager
-			&& cast->ctx->ext_output_image_capture_source_manager) {
+			&& (cast->target->type != MONITOR || cast->ctx->ext_output_image_capture_source_manager)) {
 		xdpw_ext_ic_session_close(cast);
-	} else if (cast->ctx->screencopy_manager) {
+	} else if (cast->target->type == MONITOR && cast->ctx->screencopy_manager) {
 		xdpw_wlr_sc_session_close(cast);
 	}
 }
 
 int xdpw_wlr_session_init(struct xdpw_screencast_instance *cast) {
 	if (cast->ctx->ext_image_copy_capture_manager
-			&& cast->ctx->ext_output_image_capture_source_manager) {
+			&& (cast->target->type != MONITOR || cast->ctx->ext_output_image_capture_source_manager)) {
 		return xdpw_ext_ic_session_init(cast);
-	} else if (cast->ctx->screencopy_manager) {
+	} else if (cast->target->type == MONITOR && cast->ctx->screencopy_manager) {
 		return xdpw_wlr_sc_session_init(cast);
 	}
 	return -1;
@@ -183,6 +186,10 @@ static struct xdpw_wlr_output *xdpw_wlr_output_find(struct xdpw_screencast_conte
 
 bool xdpw_wlr_target_from_data(struct xdpw_screencast_context *ctx, struct xdpw_screencast_target *target,
 		struct xdpw_screencast_restore_data *data) {
+	if (!data->output_name || !(ctx->screencopy_manager ||
+			(ctx->ext_image_copy_capture_manager && ctx->ext_output_image_capture_source_manager))) {
+		return false;
+	}
 	struct xdpw_wlr_output *out = NULL;
 	out = xdpw_wlr_output_find_by_name(&ctx->output_list, data->output_name);
 
@@ -485,6 +492,14 @@ static void wlr_registry_handle_add(void *data, struct wl_registry *reg,
 			reg, id, &zwlr_screencopy_manager_v1_interface, version);
 	}
 
+	if (!strcmp(interface, ext_workspace_manager_v1_interface.name)) {
+		xdpw_workspace_bind(ctx, reg, id);
+	}
+	if (!strcmp(interface, ext_workspace_image_capture_source_v1_interface.name)) {
+		ctx->workspace_capture_source = wl_registry_bind(
+			reg, id, &ext_workspace_image_capture_source_v1_interface, 1);
+	}
+
 	if (!strcmp(interface, ext_output_image_capture_source_manager_v1_interface.name)) {
 		logprint(DEBUG, "wlroots: |-- registered to interface %s (Version %u)", interface, ver);
 		ctx->ext_output_image_capture_source_manager = wl_registry_bind(
@@ -545,6 +560,7 @@ static void wlr_registry_handle_remove(void *data, struct wl_registry *reg,
 	struct xdpw_screencast_context *ctx = data;
 	struct xdpw_wlr_output *output = xdpw_wlr_output_find(ctx, NULL, id);
 	if (output) {
+		xdpw_workspace_output_remove(ctx, output->output);
 		logprint(DEBUG, "wlroots: output removed (%s)", output->name);
 		struct xdpw_screencast_instance *cast, *tmp;
 		wl_list_for_each_safe(cast, tmp, &ctx->screencast_instances, link) {
@@ -568,6 +584,8 @@ int xdpw_wlr_screencopy_init(struct xdpw_state *state) {
 	wl_list_init(&ctx->output_list);
 	wl_list_init(&ctx->screencast_instances);
 	wl_list_init(&ctx->toplevels);
+	wl_list_init(&ctx->workspaces);
+	wl_list_init(&ctx->workspace_groups);
 	wl_array_init(&ctx->format_modifier_pairs);
 
 	// retrieve registry
@@ -577,10 +595,19 @@ int xdpw_wlr_screencopy_init(struct xdpw_state *state) {
 	wl_display_roundtrip(state->wl_display);
 
 	logprint(DEBUG, "wayland: registry listeners run");
+	if (wl_display_roundtrip(state->wl_display) < 0) {
+		return -1;
+	}
 
-	if (ctx->ext_image_copy_capture_manager && ctx->ext_output_image_capture_source_manager) {
+	bool has_ext_capture = ctx->ext_image_copy_capture_manager &&
+		(ctx->ext_output_image_capture_source_manager ||
+		(ctx->workspace_manager && ctx->workspace_capture_source) ||
+		(ctx->ext_foreign_toplevel_list && ctx->ext_foreign_toplevel_image_capture_source_manager));
+	if (has_ext_capture) {
 		logprint(DEBUG, "wayland: using ext_image_copy_capture");
-	} else if (ctx->screencopy_manager && ctx->linux_dmabuf) {
+	}
+	if (ctx->screencopy_manager && ctx->linux_dmabuf &&
+			!(ctx->ext_image_copy_capture_manager && ctx->ext_output_image_capture_source_manager)) {
 		if (zwp_linux_dmabuf_v1_get_version(ctx->linux_dmabuf) >= ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION) {
 			ctx->linux_dmabuf_feedback = zwp_linux_dmabuf_v1_get_default_feedback(ctx->linux_dmabuf);
 			zwp_linux_dmabuf_feedback_v1_add_listener(ctx->linux_dmabuf_feedback, &linux_dmabuf_listener_feedback, ctx);
@@ -599,13 +626,21 @@ int xdpw_wlr_screencopy_init(struct xdpw_state *state) {
 				logprint(ERROR, "System doesn't support gbm!");
 			}
 		}
-	} else {
+	} else if (!has_ext_capture) {
 		logprint(ERROR, "Compositor supports neither ext_image_copy_capture or wlr_screencopy!");
 		return -1;
 	}
 
-	if (ctx->ext_image_copy_capture_manager && ctx->ext_foreign_toplevel_image_capture_source_manager) {
+	if (ctx->ext_image_copy_capture_manager && ctx->ext_foreign_toplevel_list && ctx->ext_foreign_toplevel_image_capture_source_manager) {
 		state->screencast_source_types |= WINDOW;
+	}
+
+	if ((ctx->ext_image_copy_capture_manager && ctx->ext_output_image_capture_source_manager) ||
+			ctx->screencopy_manager || (ctx->ext_image_copy_capture_manager &&
+			ctx->workspace_manager && ctx->workspace_capture_source)) {
+		state->screencast_source_types |= MONITOR;
+	} else {
+		state->screencast_source_types &= ~MONITOR;
 	}
 
 	// make sure our wlroots supports shm protocol
@@ -632,6 +667,10 @@ int xdpw_wlr_screencopy_init(struct xdpw_state *state) {
 
 void xdpw_wlr_screencopy_finish(struct xdpw_screencast_context *ctx) {
 	wl_array_release(&ctx->format_modifier_pairs);
+	xdpw_workspace_finish(ctx);
+	if (ctx->workspace_capture_source) {
+		ext_workspace_image_capture_source_v1_destroy(ctx->workspace_capture_source);
+	}
 
 	struct xdpw_wlr_output *output, *tmp_o;
 	wl_list_for_each_safe(output, tmp_o, &ctx->output_list, link) {

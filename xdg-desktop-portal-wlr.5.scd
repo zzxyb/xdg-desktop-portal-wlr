@@ -88,6 +88,7 @@ The chooser can be any program or script with the following behaviour:
    - For simple choosers:
      - The prefix "Monitor: " followed by the name of a valid output as given by **wayland-info**(1).
      - The prefix "Window: " followed by the ext-foreign-toplevel-list-v1 identifier as given by **lswt**(1).
+     - The prefix "Workspace: " followed by the decimal Wayland object ID of an ext_workspace_handle_v1 in this portal connection. Use a dmenu chooser to select workspaces interactively.
    - For dmenu choosers: one of the lines provided via stdin.
    Everything else will be handled as declined by the user.
 - To signal that the user has declined screencast, the chooser should exit without
@@ -95,7 +96,16 @@ The chooser can be any program or script with the following behaviour:
 
 Supported types of choosers via the **chooser_type** option:
 - simple: the chooser is just called without anything further on stdin.
-- dmenu: the chooser receives a newline separated list (dmenu style) of outputs on stdin.
+- dmenu: the chooser receives a newline separated list (dmenu style) of sources on stdin.
+
+Workspace recording requires ext-workspace-v1, ext-workspace-image-capture-source-v1,
+and ext-image-copy-capture-v1 support in the compositor. Workspaces are offered for
+ScreenCast MONITOR requests and reported as MONITOR sources, since the portal API
+has no workspace source type. Inactive workspaces can be recorded without activating
+them. Hidden workspaces are omitted. Workspace names may be duplicated; menu entries
+include the Wayland object ID to distinguish them. Workspace selections do not
+support persistence or restore tokens. With workspace capture available, the default
+chooser skips slurp and tries the menu choosers.
 
 # SEE ALSO
 

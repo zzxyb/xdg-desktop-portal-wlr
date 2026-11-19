@@ -27,6 +27,8 @@ enum cursor_modes {
 enum source_types {
   MONITOR = 1,
   WINDOW = 2,
+  // Internal target type; exposed as MONITOR by the ScreenCast API.
+  WORKSPACE = 8,
 };
 
 enum persist_modes {
@@ -106,6 +108,21 @@ struct xdpw_toplevel {
 	char *identifier;
 };
 
+struct xdpw_workspace_group {
+	struct wl_list link;
+	struct xdpw_screencast_context *ctx;
+	struct ext_workspace_group_handle_v1 *handle;
+	struct wl_list outputs;
+};
+
+struct xdpw_workspace {
+	struct wl_list link;
+	struct xdpw_screencast_context *ctx;
+	struct ext_workspace_handle_v1 *handle;
+	char *name;
+	struct xdpw_workspace_group *group;
+};
+
 struct xdpw_screencast_context {
 	// xdpw
 	struct xdpw_state *state;
@@ -135,6 +152,11 @@ struct xdpw_screencast_context {
 	// sessions
 	struct wl_list screencast_instances;
 
+	struct ext_workspace_manager_v1 *workspace_manager;
+	struct ext_workspace_image_capture_source_v1 *workspace_capture_source;
+	struct wl_list workspaces;
+	struct wl_list workspace_groups;
+
 	// toplevels
 	struct wl_list toplevels;
 };
@@ -148,6 +170,9 @@ struct xdpw_screencast_target {
 
 	// only for WINDOW
 	struct xdpw_toplevel *toplevel;
+
+	// only for WORKSPACE
+	struct xdpw_workspace *workspace;
 };
 
 struct xdpw_screencast_restore_data {

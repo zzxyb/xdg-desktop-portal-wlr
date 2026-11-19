@@ -3,6 +3,7 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
 #include "ext-image-capture-source-v1-client-protocol.h"
 #include "ext-image-copy-capture-v1-client-protocol.h"
+#include "ext-workspace-image-capture-source-v1-client-protocol.h"
 #include <drm_fourcc.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -257,6 +258,13 @@ static const struct ext_image_copy_capture_frame_v1_listener ext_frame_listener 
 static int ext_register_session_cb(struct xdpw_screencast_instance *cast) {
 	struct ext_image_capture_source_v1 *source = NULL;
 	switch (cast->target->type) {
+	case WORKSPACE:
+		if (!cast->ctx->workspace_capture_source || !cast->target->workspace) {
+			return -1;
+		}
+		source = ext_workspace_image_capture_source_v1_create_source(
+			cast->ctx->workspace_capture_source, cast->target->workspace->handle);
+		break;
 	case MONITOR:
 		if (cast->ctx->ext_output_image_capture_source_manager == NULL) {
 			logprint(INFO, "ext: screencast output: unsupported");
@@ -283,6 +291,7 @@ static int ext_register_session_cb(struct xdpw_screencast_instance *cast) {
 			cast->target->with_cursor ? EXT_IMAGE_COPY_CAPTURE_MANAGER_V1_OPTIONS_PAINT_CURSORS : 0);
 	ext_image_copy_capture_session_v1_add_listener(cast->ext_session.capture_session,
 			&ext_session_listener, cast);
+	ext_image_capture_source_v1_destroy(source);
 	logprint(TRACE, "ext: session callbacks registered");
 	return 0;
 }

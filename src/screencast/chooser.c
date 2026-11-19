@@ -6,6 +6,7 @@
 #include "string_util.h"
 #include "wlr_screencast.h"
 #include "xdpw.h"
+#include "workspace.h"
 
 static struct xdpw_wlr_output *xdpw_wlr_output_first(struct wl_list *output_list) {
 	struct xdpw_wlr_output *output, *tmp;
@@ -127,6 +128,23 @@ static char *get_toplevel_label(struct xdpw_toplevel *toplevel, enum xdpw_choose
 	}
 }
 
+static char *get_workspace_label(struct xdpw_workspace *workspace, enum xdpw_chooser_types type) {
+	uint32_t id = wl_proxy_get_id((struct wl_proxy *)workspace->handle);
+	struct xdpw_wlr_output *output = xdpw_workspace_get_output(workspace);
+	if (!output) {
+		return format_str("Workspace: %u", id);
+	}
+	char *output_label = get_output_label(output, type);
+	if (!output_label) {
+		return NULL;
+	}
+	const char *output_text = output_label + strlen("Monitor: ");
+	char *label = format_str("Workspace: %s - %s", output_text,
+		workspace->name ? workspace->name : "Unnamed");
+	free(output_label);
+	return label;
+}
+
 static bool wlr_chooser(const struct xdpw_chooser *chooser,
 		struct xdpw_screencast_context *ctx, struct xdpw_screencast_target *target,
 		uint32_t type_mask) {
@@ -153,6 +171,15 @@ static bool wlr_chooser(const struct xdpw_chooser *chooser,
 			struct xdpw_toplevel *toplevel;
 			wl_list_for_each(toplevel, &ctx->toplevels, link) {
 				char *label = get_toplevel_label(toplevel, chooser->type);
+				fprintf(chooser_in, "%s\n", label);
+				free(label);
+			}
+		}
+		if ((type_mask & WORKSPACE) && ctx->ext_image_copy_capture_manager &&
+				ctx->workspace_manager && ctx->workspace_capture_source) {
+			struct xdpw_workspace *workspace;
+			wl_list_for_each(workspace, &ctx->workspaces, link) {
+				char *label = get_workspace_label(workspace, chooser->type);
 				fprintf(chooser_in, "%s\n", label);
 				free(label);
 			}
@@ -208,6 +235,21 @@ static bool wlr_chooser(const struct xdpw_chooser *chooser,
 		}
 	}
 
+	if (!found && (type_mask & WORKSPACE) && ctx->ext_image_copy_capture_manager &&
+			ctx->workspace_manager && ctx->workspace_capture_source) {
+		struct xdpw_workspace *workspace;
+		wl_list_for_each(workspace, &ctx->workspaces, link) {
+			char *label = get_workspace_label(workspace, chooser->type);
+			found = strcmp(selected_label, label) == 0;
+			free(label);
+			if (found) {
+				target->type = WORKSPACE;
+				target->workspace = workspace;
+				break;
+			}
+		}
+	}
+
 	if (!found) {
 		logprint(ERROR, "wlroots: chooser %s selected unknown target: %s", chooser->cmd, selected_label);
 	}
@@ -243,12 +285,19 @@ static bool wlr_chooser_default(struct xdpw_screencast_context *ctx, struct xdpw
 					default_chooser[i].cmd);
 			continue;
 		}
-		return target->output || target->toplevel;
+		return target->output || target->toplevel || target->workspace;
 	}
 	return false;
 }
 
 bool xdpw_wlr_target_chooser(struct xdpw_screencast_context *ctx, struct xdpw_screencast_target *target, uint32_t type_mask) {
+	// Workspaces are exposed as monitor sources by the portal API.
+	if ((type_mask & MONITOR) && ctx->ext_image_copy_capture_manager &&
+			ctx->workspace_manager && ctx->workspace_capture_source &&
+			!wl_list_empty(&ctx->workspaces)) {
+		type_mask |= WORKSPACE;
+	}
+
 	switch (ctx->state->config->screencast_conf.chooser_type) {
 	case XDPW_CHOOSER_DEFAULT:
 		return wlr_chooser_default(ctx, target, type_mask);
@@ -276,7 +325,7 @@ bool xdpw_wlr_target_chooser(struct xdpw_screencast_context *ctx, struct xdpw_sc
 			logprint(ERROR, "wlroots: chooser %s failed", chooser.cmd);
 			goto end;
 		}
-		return target->output || target->toplevel;
+		return target->output || target->toplevel || target->workspace;
 	}
 end:
 	return false;
